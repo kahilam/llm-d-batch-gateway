@@ -1,0 +1,23 @@
+# Scenario 7: AIMD + Legacy admission gating
+# Same processor AIMD config as S3, but batch routes through the router
+# with inferenceObjective "batch-sheddable" so the LegacyAdmissionController
+# can identify and reject batch requests during saturation.
+processor:
+  config:
+    dispatchMode: sync
+    concurrency:
+      global: 60
+      perEndpoint: 30
+      recovery: 5
+      aimd:
+        enabled: true
+        min: 5
+        backoffFactor: 0.5
+        additiveIncrease: 1
+    globalInferenceGateway:
+      url: "http://llm-d-inference-gateway-istio:80"
+      inferenceObjective: "batch-sheddable"
+      requestTimeout: "30s"
+      maxRetries: 3
+      initialBackoff: "1s"
+      maxBackoff: "10s"

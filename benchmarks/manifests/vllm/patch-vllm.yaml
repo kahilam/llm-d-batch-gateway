@@ -10,28 +10,37 @@ spec:
         - name: modelserver
           command: ["vllm", "serve"]
           args:
-            - "Qwen/Qwen3-8B"
+            - "openai/gpt-oss-120b"
             - "--max-model-len=4096"
             - "--enable-chunked-prefill"
             - "--tensor-parallel-size=1"
+            - "--gpu-memory-utilization=0.90"
+            - "--max-num-seqs=1024"
+            - "--quantization=fp4"
             - "--disable-access-log-for-endpoints=/health,/metrics,/v1/models"
+          env:
+            - name: HUGGING_FACE_HUB_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: llm-d-hf-token
+                  key: HF_TOKEN
           resources:
             limits:
               cpu: "16"
-              memory: 32Gi
+              memory: 160Gi
               nvidia.com/gpu: 1
             requests:
               cpu: "4"
-              memory: 16Gi
+              memory: 80Gi
               nvidia.com/gpu: 1
           volumeMounts:
             - mountPath: /dev/shm
               name: shm
           startupProbe:
-            initialDelaySeconds: 15
-            periodSeconds: 10
-            timeoutSeconds: 5
-            failureThreshold: 60
+            initialDelaySeconds: 30
+            periodSeconds: 15
+            timeoutSeconds: 10
+            failureThreshold: 120
           livenessProbe:
             periodSeconds: 10
             timeoutSeconds: 5
@@ -44,4 +53,4 @@ spec:
         - name: shm
           emptyDir:
             medium: Memory
-            sizeLimit: 8Gi
+            sizeLimit: 32Gi

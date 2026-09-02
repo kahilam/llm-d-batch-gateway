@@ -1,0 +1,28 @@
+# Legacy admission overlay for llm-d Router (router.epp.* format for v0.9.0+ charts).
+# Configures concurrency-detector as saturation detector WITHOUT flow control.
+#
+# When flow control is off, the router uses LegacyAdmissionController:
+#   - Sheddable requests (priority < 0) are rejected with 429 when saturation >= 1.0
+#   - Non-sheddable requests (priority >= 0) always pass admission
+#
+# Combined with processor AIMD: 429 triggers multiplicative decrease,
+# producing the sawtooth concurrency pattern for batch traffic.
+#
+# maxConcurrency tuning: Set just above observed peak interactive in-flight.
+# gpt-oss-120b TP=1 peaks at ~47 interactive requests. With maxConcurrency=50,
+# any batch load pushes total above 50 → saturation > 1.0 →
+# LegacyAdmissionController rejects batch (priority -1) with 429 → AIMD backs off.
+router:
+  epp:
+    pluginsConfigFile: "legacy-admission-plugins.yaml"
+    pluginsCustomConfig:
+      legacy-admission-plugins.yaml: |
+        apiVersion: inference.networking.x-k8s.io/v1alpha1
+        kind: EndpointPickerConfig
+        plugins:
+          - type: concurrency-detector
+            parameters:
+              maxConcurrency: 50
+              concurrencyMultiplier: 1
+        saturationDetector:
+          pluginRef: concurrency-detector

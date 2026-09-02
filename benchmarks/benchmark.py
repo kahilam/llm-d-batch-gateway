@@ -462,14 +462,6 @@ def start_interactive_traffic(cfg, namespace):
         f"burst@{cfg.burst_rate}/s for {cfg.burst_seconds}s, "
         f"idle@{cfg.idle_rate}/s for {cfg.idle_seconds}s")
 
-    backend_kwargs = json.dumps({
-        "extras": {
-            "headers": {
-                "x-gateway-inference-objective": "interactive-default",
-            },
-        },
-    })
-
     cycle_lines = []
     for c in range(1, cfg.cycles + 1):
         suffix = "warmup" if c <= cfg.warmup_cycles else ""
@@ -492,8 +484,7 @@ def start_interactive_traffic(cfg, namespace):
         f'T="{cfg.target}"',
         f'M="{cfg.model}"',
         f'COMMON="--request-format text_completions --model $M '
-        f'--data prompt_tokens={cfg.prompt_tokens},output_tokens=512 '
-        f"--backend-kwargs '{backend_kwargs}' "
+        f'--data prompt_tokens={cfg.prompt_tokens},output_tokens=128 '
         f'--processor $M --disable-console-interactive"',
         'mkdir -p /results',
     ] + cycle_lines + ['echo "=== Done ==="']
@@ -550,21 +541,12 @@ def start_batch_as_interactive_traffic(cfg, namespace):
     log(f"  Starting batch-as-interactive traffic: {total_requests} requests "
         f"at ~{rate} req/s over {total_duration}s")
 
-    backend_kwargs = json.dumps({
-        "extras": {
-            "headers": {
-                "x-gateway-inference-objective": "interactive-default",
-            },
-        },
-    })
-
     indent = " " * 14
     script_lines = [
         f'T="{cfg.target}"',
         f'M="{cfg.model}"',
         f'COMMON="--request-format text_completions --model $M '
-        f'--data prompt_tokens={cfg.prompt_tokens},output_tokens=512 '
-        f"--backend-kwargs '{backend_kwargs}' "
+        f'--data prompt_tokens={cfg.prompt_tokens},output_tokens=128 '
         f'--processor $M --disable-console-interactive"',
         'mkdir -p /results',
         f'echo "=== Batch-as-interactive: {total_requests} requests at {rate} req/s ==="',
@@ -1895,6 +1877,7 @@ def _managed_setup(args, scenario):
         "MODE": "gpu",
         "NAMESPACE": namespace,
         "KUBE_CONTEXT": args.context,
+        "MODEL": args.model,
         "GHCR_USER": ghcr_user,
         "GHCR_TOKEN": ghcr_token,
         "ROUTER_REPO": router_repo,
@@ -2679,6 +2662,11 @@ def main():
                     "p50": sum(p.ttft_p50 for p in burst_phases) / n,
                     "p95": sum(p.ttft_p95 for p in burst_phases) / n,
                     "p99": sum(p.ttft_p99 for p in burst_phases) / n,
+                },
+                "itl_ms": {
+                    "p50": sum(p.itl_p50 for p in burst_phases) / n,
+                    "p95": sum(p.itl_p95 for p in burst_phases) / n,
+                    "p99": sum(p.itl_p99 for p in burst_phases) / n,
                 },
                 "tpot_ms": {
                     "p50": sum(p.tpot_p50 for p in burst_phases) / n,

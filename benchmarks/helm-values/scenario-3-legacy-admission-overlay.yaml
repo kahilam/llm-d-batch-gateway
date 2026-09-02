@@ -1,0 +1,22 @@
+# Legacy admission overlay for llm-d Router (InferencePool EPP chart).
+# Configures concurrency-detector as saturation detector WITHOUT flow control.
+#
+# When flow control is off, the router uses LegacyAdmissionController:
+#   - Sheddable requests (priority < 0) are rejected with 429 when saturation >= 1.0
+#   - Non-sheddable requests (priority >= 0) always pass admission
+#
+# Combined with processor AIMD: 429 triggers multiplicative decrease,
+# producing the sawtooth concurrency pattern for batch traffic.
+inferenceExtension:
+  pluginsConfigFile: "legacy-admission-plugins.yaml"
+  pluginsCustomConfig:
+    legacy-admission-plugins.yaml: |
+      apiVersion: inference.networking.x-k8s.io/v1alpha1
+      kind: EndpointPickerConfig
+      plugins:
+        - type: concurrency-detector
+          parameters:
+            maxConcurrency: 50
+            concurrencyMultiplier: 1
+      saturationDetector:
+        pluginRef: concurrency-detector
