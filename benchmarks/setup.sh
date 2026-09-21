@@ -83,7 +83,6 @@ values_file_for_scenario() {
         4)   echo "${SCRIPT_DIR}/helm-values/scenario-4-flow-control-aimd.yaml" ;;
         5)   echo "${SCRIPT_DIR}/helm-values/scenario-5-async.yaml" ;;
         6)   echo "${SCRIPT_DIR}/helm-values/scenario-6-low-concurrency.yaml" ;;
-        7)   echo "${SCRIPT_DIR}/helm-values/scenario-7-aimd-legacy-admission.yaml" ;;
     esac
 }
 
@@ -358,27 +357,30 @@ else
             FLOW_CONTROL_OVERLAY="-f ${SCRIPT_DIR}/helm-values/scenario-3-admission-control-overlay-router.yaml"
         elif [ "${SCENARIO}" = "4" ]; then
             FLOW_CONTROL_OVERLAY="-f ${SCRIPT_DIR}/helm-values/scenario-4-flow-control-overlay-router.yaml"
-        elif [ "${SCENARIO}" = "7" ]; then
-            FLOW_CONTROL_OVERLAY="-f ${SCRIPT_DIR}/helm-values/scenario-3-legacy-admission-overlay-router.yaml"
         fi
         # Local repo mode (development override)
         log "  Using local repo: ROUTER_REPO=${ROUTER_REPO}"
         chart_dir="${ROUTER_REPO}/config/charts/llm-d-router-gateway"
         rm -f "${chart_dir}/Chart.lock"
         (cd "${chart_dir}" && helm dependency build >/dev/null 2>&1)
+        # Only set default pluginsConfigFile when no overlay provides one
+        PLUGINS_CFG_SET=""
+        if [ -z "${FLOW_CONTROL_OVERLAY}" ]; then
+            PLUGINS_CFG_SET="--set router.epp.pluginsConfigFile=default-plugins.yaml"
+        fi
         ${H} upgrade --install "${GUIDE_NAME}" "${chart_dir}" \
             -n "${NAMESPACE}" \
             --set router.epp.replicas=1 \
             --set router.epp.image.registry=${ROUTER_EPP_REGISTRY} \
             --set router.epp.image.repository=${ROUTER_EPP_REPOSITORY} \
             --set router.epp.image.tag=${ROUTER_EPP_TAG} \
-            --set router.epp.pluginsConfigFile=default-plugins.yaml \
+            ${PLUGINS_CFG_SET} \
             --set router.epp.resources.requests.cpu=4 \
             --set router.epp.resources.requests.memory=8Gi \
             --set router.epp.resources.limits.memory=16Gi \
             --set router.modelServers.matchLabels.llm-d\\.ai/guide=optimized-baseline \
             --set router.inferencePool.modelServerProtocol=http \
-            --set router.monitoring.prometheus.auth.enabled=true \
+            --set router.monitoring.prometheus.auth.enabled=false \
             ${FLOW_CONTROL_OVERLAY} \
             --set provider.name=istio \
             --set httpRoute.create=true \
@@ -388,8 +390,6 @@ else
             FLOW_CONTROL_OVERLAY="-f ${SCRIPT_DIR}/helm-values/scenario-3-admission-control-overlay.yaml"
         elif [ "${SCENARIO}" = "4" ]; then
             FLOW_CONTROL_OVERLAY="-f ${SCRIPT_DIR}/helm-values/scenario-4-flow-control-overlay.yaml"
-        elif [ "${SCENARIO}" = "7" ]; then
-            FLOW_CONTROL_OVERLAY="-f ${SCRIPT_DIR}/helm-values/scenario-3-legacy-admission-overlay.yaml"
         fi
         # OCI mode (default — reproducible, pinned versions)
         log "  Using OCI chart: ghcr.io/llm-d/llm-d-router-gateway:${ROUTER_CHART_VERSION}"
@@ -499,7 +499,7 @@ if [ -n "${VALUES_FILE}" ]; then
         fi
     fi
 
-    ${H} install batch-gateway \
+    ${H} upgrade --install batch-gateway \
         "${REPO_ROOT}/charts/batch-gateway/" \
         -n "${NAMESPACE}" \
         -f "${VALUES_FILE}" \
@@ -516,7 +516,7 @@ else
 fi
 
 # --- Scenario 3/4/7: InferenceObjective CRDs (priority-based routing) ---
-if [ "${SCENARIO}" = "3" ] || [ "${SCENARIO}" = "4" ] || [ "${SCENARIO}" = "7" ]; then
+if [ "${SCENARIO}" = "3" ] || [ "${SCENARIO}" = "4" ]; then
     log "Deploying InferenceObjective CRDs for flow control"
     ${K} -n "${NAMESPACE}" apply -f - <<EOF
 apiVersion: inference.networking.x-k8s.io/v1alpha2
@@ -541,17 +541,41 @@ spec:
 EOF
     log "  Created InferenceObjective: interactive-default (priority 100)"
     log "  Created InferenceObjective: batch-sheddable (priority -1)"
+
+    # Also create under llm-d.ai API group (EPP selects this when available)
+    ${K} -n "${NAMESPACE}" apply -f - <<EOF2
+apiVersion: llm-d.ai/v1alpha1
+kind: InferenceObjective
+metadata:
+  name: interactive-default
+spec:
+  priority: 100
+  poolRef:
+    group: inference.networking.k8s.io
+    name: ${GUIDE_NAME}
+---
+apiVersion: llm-d.ai/v1alpha1
+kind: InferenceObjective
+metadata:
+  name: batch-sheddable
+spec:
+  priority: -1
+  poolRef:
+    group: inference.networking.k8s.io
+    name: ${GUIDE_NAME}
+EOF2
+    log "  Created InferenceObjective (llm-d.ai): interactive-default, batch-sheddable"
 fi
 
 # --- Scenario 5: Async processor ---
 if [ "${SCENARIO}" = "5" ]; then
     log "ERROR: Scenario 5 (async) is blocked on async-processor integration"
-    log "  Skipping async-processor deployment"
+    exit 1
 fi
 
 if [ -n "${VALUES_FILE}" ]; then
     ${K} -n "${NAMESPACE}" rollout status deploy/batch-gateway-apiserver --timeout=60s >/dev/null
-    ${K} -n "${NAMESPACE}" rollout status deploy/batch-gateway-processor --timeout=60s >/dev/null
+    ${K} -n "${NAMESPACE}" rollout status statefulset/batch-gateway-processor --timeout=60s >/dev/null
 fi
 
 # --- Prometheus ServiceMonitor (GPU mode, scenarios >= 3) ---
