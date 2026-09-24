@@ -64,8 +64,13 @@ for var in KUBE_CONTEXT SCENARIO; do
     fi
 done
 
-if [ "${SCENARIO}" -lt 0 ] || [ "${SCENARIO}" -gt 7 ]; then
-    echo "ERROR: SCENARIO must be 0-7, got: ${SCENARIO}" >&2
+if [ "${SCENARIO}" -lt 0 ] || [ "${SCENARIO}" -gt 6 ]; then
+    echo "ERROR: SCENARIO must be 0-6, got: ${SCENARIO}" >&2
+    exit 1
+fi
+
+if [ "${MODE}" = "sim" ] && [ "${SCENARIO}" = "3" ]; then
+    echo "ERROR: MODE=sim SCENARIO=3 is unsupported; use MODE=gpu for admission control or SCENARIO=4 for the simulator EPP path" >&2
     exit 1
 fi
 
@@ -344,12 +349,10 @@ else
     # --- llm-d Router (EPP) ---
     log "Installing llm-d Router (${GUIDE_NAME})"
 
-    # Scenario 4/7: include router overlay for priority-based scheduling
+    # Scenario 4: include router overlay for priority-based scheduling
     FLOW_CONTROL_OVERLAY=""
     if [ "${SCENARIO}" = "4" ]; then
         log "  Flow control: enabling EPP priority bands (interactive=100, batch=-1)"
-    elif [ "${SCENARIO}" = "7" ]; then
-        log "  Legacy admission: enabling saturation-based batch shedding"
     fi
 
     if [ -n "${ROUTER_REPO:-}" ]; then
@@ -485,7 +488,7 @@ if [ -n "${VALUES_FILE}" ]; then
 
     # In sim mode, replace all model gateways with a single entry
     if [ "${MODE}" = "sim" ]; then
-        if [ "${SCENARIO}" = "4" ] || [ "${SCENARIO}" = "7" ]; then
+        if [ "${SCENARIO}" = "4" ]; then
             # Scenario 4: route through EPP for flow control; null out globalInferenceGateway from values file
             BG_EXTRA_ARGS+=(
                 --set-json "processor.config.globalInferenceGateway=null"
@@ -515,7 +518,7 @@ else
     log "Skipping batch-gateway (not needed for scenario ${SCENARIO})"
 fi
 
-# --- Scenario 3/4/7: InferenceObjective CRDs (priority-based routing) ---
+# --- Scenario 3/4: InferenceObjective CRDs (priority-based routing) ---
 if [ "${SCENARIO}" = "3" ] || [ "${SCENARIO}" = "4" ]; then
     log "Deploying InferenceObjective CRDs for flow control"
     ${K} -n "${NAMESPACE}" apply -f - <<EOF
