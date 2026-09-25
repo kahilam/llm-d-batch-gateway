@@ -271,10 +271,9 @@ inferenceExtension:
         - type: round-robin-fairness-policy
         - type: global-strict-fairness-policy
         - type: slo-deadline-ordering-policy
-        - type: utilization-detector
+        - type: concurrency-detector
           parameters:
-            queueDepthThreshold: 2
-            kvCacheUtilThreshold: 0.5
+            maxConcurrency: 1000
       flowControl:
         maxBytes: 4294967296
         defaultRequestTTL: 30s
@@ -292,7 +291,7 @@ inferenceExtension:
           fairnessPolicyRef: global-strict-fairness-policy
           orderingPolicyRef: fcfs-ordering-policy
       saturationDetector:
-        pluginRef: utilization-detector
+        pluginRef: concurrency-detector
 VALUESEOF
 
         # Install EPP standalone chart
