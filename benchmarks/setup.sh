@@ -547,7 +547,7 @@ EOF
 
     # Also create under llm-d.ai API group (EPP selects this when available)
     ${K} -n "${NAMESPACE}" apply -f - <<EOF2
-apiVersion: llm-d.ai/v1alpha1
+apiVersion: llm-d.ai/v1alpha2
 kind: InferenceObjective
 metadata:
   name: interactive-default
@@ -557,7 +557,7 @@ spec:
     group: inference.networking.k8s.io
     name: ${GUIDE_NAME}
 ---
-apiVersion: llm-d.ai/v1alpha1
+apiVersion: llm-d.ai/v1alpha2
 kind: InferenceObjective
 metadata:
   name: batch-sheddable
