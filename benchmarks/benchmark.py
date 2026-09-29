@@ -31,6 +31,7 @@ import csv
 import datetime
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -287,16 +288,27 @@ def _batch_submit_script():
             )
             status = json.loads(urlopen(req).read())
             s = status["status"]
-            c = status["request_counts"].get("completed", 0)
-            t = status["request_counts"].get("total", 0)
-            print(f"Batch {batch_id}: status={s} completed={c}/{t} ({elapsed}s)", flush=True)
+            counts = status.get("request_counts", {})
+            c = counts.get("completed", 0)
+            t = counts.get("total", 0)
+            print(
+                f"Batch {batch_id}: status={s} completed={c}/{t} "
+                f"counts={json.dumps(counts, sort_keys=True)} ({elapsed}s)",
+                flush=True,
+            )
             if s in ("completed", "failed", "cancelled", "expired"):
-                print(f"Terminal: {s}", flush=True)
+                print(
+                    f"Terminal: {s} counts={json.dumps(counts, sort_keys=True)}",
+                    flush=True,
+                )
                 break
             time.sleep(5)
             elapsed += 5
         else:
-            print("Timed out", flush=True)
+            print(
+                f"Timed out counts={json.dumps(counts, sort_keys=True)}",
+                flush=True,
+            )
     """)
 
 
@@ -599,43 +611,103 @@ spec:
 # ---------------------------------------------------------------------------
 
 
-def get_batch_progress(context, namespace):
-    """Aggregate batch progress across all batch jobs."""
-    completed, total = 0, 0
-    for name in ["job-a", "job-b", "job-c"]:
+def _parse_batch_progress_line(line):
+    """Parse one batch worker progress line, including optional JSON counts."""
+    match = re.search(r"completed=(\d+)/(\d+)", line)
+    if not match:
+        return None
+
+    completed = int(match.group(1))
+    total = int(match.group(2))
+    counts = {"completed": completed, "total": total}
+    if "counts=" in line:
         try:
-            out = kubectl(["logs", f"job/{name}", "--tail=5"],
-                         context, namespace, check=False)
-            for line in reversed(out.split("\n")):
-                if "completed=" in line and "/" in line.split("completed=")[1]:
-                    parts = line.split("completed=")[1].split()[0].split("/")
-                    completed += int(parts[0])
-                    total += int(parts[1])
-                    break
-        except Exception:
+            counts_text = line.split("counts=", 1)[1].strip()
+            parsed_counts, _ = json.JSONDecoder().raw_decode(counts_text)
+            counts.update(parsed_counts)
+        except (json.JSONDecodeError, TypeError, ValueError):
             pass
-    return completed, total
+
+    status = "in_progress"
+    if "Terminal:" in line:
+        status = line.split("Terminal:", 1)[1].split("counts=", 1)[0].strip()
+    elif line.startswith("Timed out"):
+        status = "timed_out"
+    elif "status=" in line:
+        status = line.split("status=", 1)[1].split()[0]
+
+    return {
+        "submitted": int(counts.get("total", total) or 0),
+        "completed": int(counts.get("completed", completed) or 0),
+        "failed": int(counts.get("failed", 0) or 0),
+        "cancelled": int(counts.get("cancelled", 0) or 0),
+        "expired": int(counts.get("expired", 0) or 0),
+        "status": status,
+    }
+
+
+def _finalize_batch_accounting(progress):
+    """Add derived pending accounting without guessing queued versus in-flight."""
+    terminal = (
+        progress["completed"]
+        + progress["failed"]
+        + progress["cancelled"]
+        + progress["expired"]
+    )
+    progress["pending"] = max(progress["submitted"] - terminal, 0)
+    progress["queued"] = None
+    progress["in_flight"] = None
+    return progress
+
+
+def _aggregate_batch_accounting(per_job):
+    """Aggregate per-job request counts for one timeline sample."""
+    accounting = {
+        "submitted": 0,
+        "completed": 0,
+        "failed": 0,
+        "cancelled": 0,
+        "expired": 0,
+        "pending": 0,
+        "queued": None,
+        "in_flight": None,
+        "jobs": per_job,
+    }
+    for progress in per_job.values():
+        for field in ("submitted", "completed", "failed", "cancelled", "expired", "pending"):
+            accounting[field] += progress.get(field, 0)
+    return accounting
+
+
+def get_batch_progress(context, namespace):
+    """Aggregate completed and submitted counts across all batch jobs."""
+    accounting = _aggregate_batch_accounting(get_per_job_progress(context, namespace))
+    return accounting["completed"], accounting["submitted"]
 
 
 def get_per_job_progress(context, namespace):
-    """Get per-job batch progress: {job_name: {completed, total, status}}."""
+    """Get per-job batch accounting from the worker logs."""
     jobs = {}
     for name in list(JOB_SLO_WINDOWS.keys()):
         try:
-            out = kubectl(["logs", f"job/{name}", "--tail=10"],
+            out = kubectl(["logs", f"job/{name}", "--tail=20"],
                          context, namespace, check=False)
-            job_completed, job_total = 0, 0
-            status = "in_progress"
+            progress = None
             for line in reversed(out.split("\n")):
-                if "Terminal:" in line:
-                    status = line.split("Terminal:")[1].strip()
+                parsed = _parse_batch_progress_line(line)
+                if parsed:
+                    progress = parsed
                     break
-                if "completed=" in line and "/" in line.split("completed=")[1]:
-                    parts = line.split("completed=")[1].split()[0].split("/")
-                    job_completed = int(parts[0])
-                    job_total = int(parts[1])
-                    break
-            jobs[name] = {"completed": job_completed, "total": job_total, "status": status}
+            if progress is None:
+                progress = {
+                    "submitted": 0,
+                    "completed": 0,
+                    "failed": 0,
+                    "cancelled": 0,
+                    "expired": 0,
+                    "status": "not_observed",
+                }
+            jobs[name] = _finalize_batch_accounting(progress)
         except Exception as e:
             log(f"  DEBUG: Failed to parse progress for {name}: {e}")
     return jobs
@@ -692,6 +764,7 @@ def monitor_scenario(cfg, scenario, namespace):
             last_phase = phase
 
         per_job = get_per_job_progress(cfg.context, namespace)
+        batch_accounting = _aggregate_batch_accounting(per_job)
         for jname, jinfo in per_job.items():
             if jname not in job_completion_times and jinfo["status"] == "completed":
                 job_completion_times[jname] = round(elapsed)
@@ -701,6 +774,7 @@ def monitor_scenario(cfg, scenario, namespace):
             "elapsed": round(elapsed),
             "completed": completed,
             "total": total,
+            "batch_accounting": batch_accounting,
             "phase": phase,
             "prometheus": collect_live_prometheus_metrics(namespace),
         }
