@@ -644,7 +644,7 @@ def get_per_job_progress(context, namespace):
 def get_current_phase(context, namespace):
     """Get current guidellm phase from job logs."""
     try:
-        out = kubectl(["logs", "job/guidellm-interactive", "--tail=20"],
+        out = kubectl(["logs", "job/guidellm-interactive", "--tail=200"],
                      context, namespace, check=False)
         phase = "unknown"
         for line in out.split("\n"):
@@ -655,10 +655,29 @@ def get_current_phase(context, namespace):
         return "unknown"
 
 
+def wait_for_guidellm_start(context, namespace, timeout=30):
+    """Wait until guidellm has emitted its first phase marker."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            out = kubectl(
+                ["logs", "job/guidellm-interactive", "--tail=200"],
+                context, namespace, check=False,
+            )
+            if any(line.startswith("=== Phase") for line in out.splitlines()):
+                return True
+        except Exception:
+            pass
+        time.sleep(2)
+    log("  WARNING: guidellm phase marker was not observed before monitoring started")
+    return False
+
+
 def monitor_scenario(cfg, scenario, namespace):
-    """Monitor batch progress during interactive traffic, return timeline."""
+    """Monitor batch progress and live Prometheus metrics during traffic."""
     timeline = []
     job_completion_times = {}
+    last_phase = None
     start = time.time()
     total_duration = cfg.cycles * (cfg.burst_seconds + cfg.idle_seconds) + 300
 
@@ -667,18 +686,25 @@ def monitor_scenario(cfg, scenario, namespace):
 
         completed, total = get_batch_progress(cfg.context, namespace)
         phase = get_current_phase(cfg.context, namespace)
+        if phase == "unknown" and last_phase is not None:
+            phase = last_phase
+        elif phase != "unknown":
+            last_phase = phase
 
         per_job = get_per_job_progress(cfg.context, namespace)
         for jname, jinfo in per_job.items():
             if jname not in job_completion_times and jinfo["status"] == "completed":
                 job_completion_times[jname] = round(elapsed)
 
-        timeline.append({
+        sample = {
+            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
             "elapsed": round(elapsed),
             "completed": completed,
             "total": total,
             "phase": phase,
-        })
+            "prometheus": collect_live_prometheus_metrics(namespace),
+        }
+        timeline.append(sample)
 
         log(f"  [s{scenario}] {phase} | batch: {completed}/{total} | {int(elapsed)}s")
 
@@ -918,11 +944,32 @@ class PrometheusPortForward:
             f"{self.local_port}:9090",
         ]
         self._process = subprocess.Popen(
-            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
         )
-        time.sleep(2)
+
+        # kubectl can remain alive briefly before the forwarded endpoint is
+        # usable. Poll the Prometheus API instead of relying on a fixed sleep.
+        import urllib.request
+        ready_url = f"{self.url}/api/v1/status/buildinfo"
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            if self._process.poll() is not None:
+                break
+            try:
+                with urllib.request.urlopen(ready_url, timeout=1):
+                    break
+            except Exception:
+                time.sleep(0.25)
+        else:
+            self._process.terminate()
+            self._process.wait(timeout=5)
+
         if self._process.poll() is not None:
-            log(f"  WARNING: Prometheus port-forward failed to start (exit={self._process.returncode})")
+            stderr = self._process.stderr.read().strip() if self._process.stderr else ""
+            log(
+                f"  WARNING: Prometheus port-forward failed to start "
+                f"(exit={self._process.returncode}): {stderr or 'endpoint not ready'}"
+            )
             self._process = None
             return False
         log(f"  Prometheus port-forward started (localhost:{self.local_port} → {self.service})")
@@ -936,6 +983,8 @@ class PrometheusPortForward:
             except subprocess.TimeoutExpired:
                 self._process.kill()
                 self._process.wait()
+            if self._process.stderr:
+                self._process.stderr.close()
             self._process = None
 
     @property
@@ -958,12 +1007,14 @@ def start_prometheus_port_forward(context, namespace, service):
     """Start a background port-forward to Prometheus if PROMETHEUS_URL is not set."""
     global _prom_port_forward
     if os.environ.get("PROMETHEUS_URL"):
-        return
+        return True
     pf = PrometheusPortForward(context, namespace, service)
     if pf.start():
         _prom_port_forward = pf
         os.environ["PROMETHEUS_URL"] = pf.url
         atexit.register(stop_prometheus_port_forward)
+        return True
+    return False
 
 
 def stop_prometheus_port_forward():
@@ -998,6 +1049,85 @@ def query_prometheus(context, namespace, query, start_time, end_time, step="15s"
     except Exception as e:
         log(f"  WARNING: Prometheus query failed: {e}")
     return []
+
+
+def live_prometheus_queries(namespace, pool="optimized-baseline"):
+    """Return the live PromQL queries used by the benchmark monitor."""
+    queue = f"llm-d-async:requests:{pool}"
+    return {
+        "vllm_running": (
+            f'vllm:num_requests_running{{inference_pool="{pool}",namespace="{namespace}"}}'
+        ),
+        "vllm_waiting": (
+            f'vllm:num_requests_waiting{{inference_pool="{pool}",namespace="{namespace}"}}'
+        ),
+        "ready_pods": (
+            f'inference_pool_ready_pods{{name="{pool}",namespace="{namespace}"}}'
+        ),
+        "epp_queue": (
+            f'avg by(name)(inference_pool_per_pod_queue_size{{'
+            f'name="{pool}",namespace="{namespace}"}})'
+        ),
+        "gate_metric_value": (
+            f'llm_d_async_async_gate_metric_value{{queue_name="{queue}"}}'
+        ),
+        "gate_metric_threshold": (
+            f'llm_d_async_async_gate_metric_threshold{{queue_name="{queue}"}}'
+        ),
+        "dispatch_budget": (
+            f'llm_d_async_async_dispatch_budget{{queue_name="{queue}"}}'
+        ),
+        "source_available": (
+            f'llm_d_async_async_gate_metric_source_available{{queue_name="{queue}"}}'
+        ),
+        "broker_backlog": (
+            f'llm_d_async_async_broker_backlog{{queue_name="{queue}"}}'
+        ),
+        "queue_depth": (
+            f'llm_d_async_async_queue_depth{{queue_name="{queue}"}}'
+        ),
+        "inflight_requests": (
+            f'llm_d_async_async_inflight_requests{{queue_name="{queue}"}}'
+        ),
+    }
+
+
+def query_prometheus_instant(query, retries=2):
+    """Query one current Prometheus vector and retain errors for the timeline."""
+    import urllib.parse
+    import urllib.request
+
+    prom_url = get_prometheus_url()
+    if not prom_url:
+        return {"query": query, "result": [], "error": "PROMETHEUS_URL is not set"}
+
+    params = urllib.parse.urlencode({"query": query})
+    url = f"{prom_url}/api/v1/query?{params}"
+    last_error = "query failed"
+    for attempt in range(retries + 1):
+        try:
+            with urllib.request.urlopen(url, timeout=5) as resp:
+                data = json.loads(resp.read())
+            if data.get("status") != "success":
+                last_error = data.get("error", "query failed")
+            else:
+                return {"query": query, "result": data["data"].get("result", [])}
+        except Exception as e:
+            last_error = str(e)
+        if attempt < retries:
+            time.sleep(0.25)
+    return {"query": query, "result": [], "error": last_error}
+
+
+def collect_live_prometheus_metrics(namespace):
+    """Collect timestamped instant metrics for one benchmark monitor sample."""
+    collected = {
+        "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z"),
+        "metrics": {},
+    }
+    for name, query in live_prometheus_queries(namespace).items():
+        collected["metrics"][name] = query_prometheus_instant(query)
+    return collected
 
 
 def collect_gpu_metrics(context, namespace, start_time, end_time):
@@ -1980,7 +2110,7 @@ def run_scenario(cfg, scenario):
 
     # Start interactive traffic (all scenarios)
     start_interactive_traffic(cfg, namespace)
-    time.sleep(30)  # Let guidellm validate and start
+    wait_for_guidellm_start(cfg.context, namespace)
 
     # Monitor
     job_completion_times = {}
