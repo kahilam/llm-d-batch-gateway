@@ -83,6 +83,8 @@ class BenchmarkConfig:
     gpu_count: int = 1
     max_model_len: int = 4096
     warmup_cycles: int = 2
+    background_batch_size: int = 0
+    background_batches_per_cycle: int = 0
 
 
 @dataclass
@@ -2614,6 +2616,12 @@ def main():
     parser.add_argument("--num-jobs", type=int,
                         default=bench_cfg.get("num_jobs", 3),
                         help="Concurrent batch jobs (default: 3)")
+    parser.add_argument("--background-batch-size", type=int,
+                        default=bench_cfg.get("background_batch_size", 0),
+                        help="Requests per separately labeled background batch (default: 0)")
+    parser.add_argument("--background-batches-per-cycle", type=int,
+                        default=bench_cfg.get("background_batches_per_cycle", 0),
+                        help="Background batches to replenish per measured cycle (default: 0)")
     parser.add_argument("--prompt-tokens", type=int,
                         default=prompt_cfg.get("prompt_tokens", 256),
                         help="Input tokens per prompt (default: 256)")
@@ -2696,6 +2704,8 @@ def main():
         gpu_count=args.gpu_count,
         max_model_len=args.max_model_len,
         warmup_cycles=args.warmup,
+        background_batch_size=args.background_batch_size,
+        background_batches_per_cycle=args.background_batches_per_cycle,
     )
 
     log("=== Batch Gateway Benchmark ===")
@@ -2703,6 +2713,11 @@ def main():
     log(f"Traffic: {cfg.burst_rate} req/s burst ({cfg.burst_seconds}s), "
         f"{cfg.idle_rate} req/s idle ({cfg.idle_seconds}s), {cfg.cycles} cycles")
     log(f"Batch: {cfg.num_jobs} jobs x {cfg.batch_size} requests")
+    if cfg.background_batch_size or cfg.background_batches_per_cycle:
+        log(
+            f"Background: {cfg.background_batches_per_cycle} batches/cycle x "
+            f"{cfg.background_batch_size} requests"
+        )
     log(f"Results: {cfg.results_dir}")
 
     # Start Prometheus port-forward if needed (for scenarios >= 3)
@@ -2762,6 +2777,8 @@ def main():
                     results_dir=trial_dir, target=cfg.target,
                     gpu_count=cfg.gpu_count, max_model_len=cfg.max_model_len,
                     warmup_cycles=cfg.warmup_cycles,
+                    background_batch_size=cfg.background_batch_size,
+                    background_batches_per_cycle=cfg.background_batches_per_cycle,
                 )
                 if args.managed:
                     _managed_setup(args, scenario)
@@ -2808,6 +2825,8 @@ def main():
             "trials": trials,
             "batch_size": cfg.batch_size,
             "num_jobs": cfg.num_jobs,
+            "background_batch_size": cfg.background_batch_size,
+            "background_batches_per_cycle": cfg.background_batches_per_cycle,
             "prompt_tokens": cfg.prompt_tokens,
             "num_system_prompts": cfg.num_system_prompts,
         },
