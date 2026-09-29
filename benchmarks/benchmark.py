@@ -31,6 +31,7 @@ import csv
 import datetime
 import json
 import os
+import shlex
 import subprocess
 import sys
 import textwrap
@@ -471,21 +472,21 @@ def start_interactive_traffic(cfg, namespace):
 
         cycle_lines.extend([
             f'echo "=== Phase {c}: IDLE ({cfg.idle_rate} req/s, {cfg.idle_seconds}s){label} ==="',
-            f'guidellm benchmark run --target "$T" $COMMON '
+            f'guidellm benchmark run --target "$T" "${{COMMON[@]}}" '
             f'--profile constant --rate {cfg.idle_rate} --max-seconds {cfg.idle_seconds} '
             f'--output-dir /results --outputs "{idle_output}"',
             f'echo "=== Phase {c}: BURST ({cfg.burst_rate} req/s, {cfg.burst_seconds}s){label} ==="',
-            f'guidellm benchmark run --target "$T" $COMMON '
+            f'guidellm benchmark run --target "$T" "${{COMMON[@]}}" '
             f'--profile constant --rate {cfg.burst_rate} --max-seconds {cfg.burst_seconds} '
             f'--output-dir /results --outputs "{burst_output}"',
         ])
 
     script_lines = [
-        f'T="{cfg.target}"',
-        f'M="{cfg.model}"',
-        f'COMMON="--request-format text_completions --model $M '
-        f'--data prompt_tokens={cfg.prompt_tokens},output_tokens=128 '
-        f'--processor $M --disable-console-interactive"',
+        f'T={shlex.quote(cfg.target)}',
+        f'M={shlex.quote(cfg.model)}',
+        f'COMMON=(--request-format text_completions --model "$M" '
+        f'--data "prompt_tokens={cfg.prompt_tokens},output_tokens=128" '
+        f'--processor "$M" --disable-console-interactive)',
         'mkdir -p /results',
     ] + cycle_lines + ['echo "=== Done ==="']
 
