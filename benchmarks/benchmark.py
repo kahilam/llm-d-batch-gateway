@@ -465,6 +465,107 @@ def submit_batches(cfg, namespace):
         kubectl_apply(job_yaml, cfg.context, namespace)
 
 
+def submit_background_batches_for_cycle(cfg, namespace, cycle):
+    """Submit separately labeled background batches for one benchmark cycle."""
+    if cfg.background_batch_size <= 0 or cfg.background_batches_per_cycle <= 0:
+        return []
+
+    names = [
+        f"background-c{cycle}-j{index}"
+        for index in range(1, cfg.background_batches_per_cycle + 1)
+    ]
+
+    for index, name in enumerate(names):
+        jsonl_path = cfg.results_dir / f"{name}.jsonl"
+        if not jsonl_path.exists():
+            log(f"  Generating background prompts for {name}...")
+            subprocess.run([
+                sys.executable, str(SCRIPT_DIR / "generate_prompts.py"),
+                "--num-requests", str(cfg.background_batch_size),
+                "--num-system-prompts", str(cfg.num_system_prompts),
+                "--prompt-tokens", str(cfg.prompt_tokens),
+                "--model", cfg.model,
+                "--seed", str(10000 + cycle * 100 + index),
+                "--output", str(jsonl_path),
+            ], check=True)
+
+    log(f"  Uploading {len(names)} background batch file(s) for cycle {cycle}...")
+    _upload_jsonl_to_pvc(cfg, namespace, names)
+
+    script = _batch_submit_script()
+    indented = "\n".join("          " + line for line in script.splitlines())
+    for name in names:
+        cm_yaml = textwrap.dedent(f"""\
+        apiVersion: v1
+        kind: ConfigMap
+        metadata:
+          name: {name}-script
+          labels:
+            batch-benchmark: "true"
+            batch-workload: background
+            background-cycle: "{cycle}"
+        data:
+          script.py: |
+        """) + indented + "\n"
+
+        job_yaml = textwrap.dedent(f"""\
+        apiVersion: batch/v1
+        kind: Job
+        metadata:
+          name: {name}
+          labels:
+            batch-benchmark: "true"
+            batch-workload: background
+            background-cycle: "{cycle}"
+        spec:
+          backoffLimit: 0
+          template:
+            metadata:
+              labels:
+                batch-benchmark: "true"
+                batch-workload: background
+                background-cycle: "{cycle}"
+                app.kubernetes.io/part-of: batch-gateway
+            spec:
+              securityContext:
+                runAsNonRoot: true
+                runAsUser: 1000
+                fsGroup: 1000
+              restartPolicy: Never
+              containers:
+                - name: batch-submit
+                  image: python:3.12-slim
+                  securityContext:
+                    allowPrivilegeEscalation: false
+                  env:
+                    - name: BATCH_GATEWAY_URL
+                      value: "http://batch-gateway-apiserver:8000"
+                    - name: INPUT_FILE
+                      value: "/data/{name}.jsonl"
+                    - name: COMPLETION_WINDOW
+                      value: "24h"
+                  command: ["python3", "-u", "/scripts/script.py"]
+                  volumeMounts:
+                    - name: script
+                      mountPath: /scripts
+                    - name: data
+                      mountPath: /data
+              volumes:
+                - name: script
+                  configMap:
+                    name: {name}-script
+                - name: data
+                  persistentVolumeClaim:
+                    claimName: benchmark-results
+        """)
+
+        log(f"  Submitting {name} (background, size={cfg.background_batch_size})")
+        kubectl_apply(cm_yaml, cfg.context, namespace)
+        kubectl_apply(job_yaml, cfg.context, namespace)
+
+    return names
+
+
 # ---------------------------------------------------------------------------
 # Interactive traffic (guidellm)
 # ---------------------------------------------------------------------------
@@ -681,16 +782,19 @@ def _aggregate_batch_accounting(per_job):
     return accounting
 
 
-def get_batch_progress(context, namespace):
-    """Aggregate completed and submitted counts across all batch jobs."""
-    accounting = _aggregate_batch_accounting(get_per_job_progress(context, namespace))
+def get_batch_progress(context, namespace, extra_jobs=None):
+    """Aggregate completed and submitted counts across tracked and extra jobs."""
+    accounting = _aggregate_batch_accounting(
+        get_per_job_progress(context, namespace, extra_jobs=extra_jobs)
+    )
     return accounting["completed"], accounting["submitted"]
 
 
-def get_per_job_progress(context, namespace):
+def get_per_job_progress(context, namespace, extra_jobs=None):
     """Get per-job batch accounting from the worker logs."""
     jobs = {}
-    for name in list(JOB_SLO_WINDOWS.keys()):
+    names = list(JOB_SLO_WINDOWS.keys()) + list(extra_jobs or [])
+    for name in names:
         try:
             out = kubectl(["logs", f"job/{name}", "--tail=20"],
                          context, namespace, check=False)
@@ -752,23 +856,53 @@ def monitor_scenario(cfg, scenario, namespace):
     timeline = []
     job_completion_times = {}
     last_phase = None
+    background_jobs = []
+    submitted_background_cycles = set()
     start = time.time()
     total_duration = cfg.cycles * (cfg.burst_seconds + cfg.idle_seconds) + 300
 
     while True:
         elapsed = time.time() - start
 
-        completed, total = get_batch_progress(cfg.context, namespace)
         phase = get_current_phase(cfg.context, namespace)
         if phase == "unknown" and last_phase is not None:
             phase = last_phase
         elif phase != "unknown":
             last_phase = phase
 
-        per_job = get_per_job_progress(cfg.context, namespace)
+        cycle_match = re.search(r"Phase (\d+):", phase)
+        if cycle_match:
+            cycle = int(cycle_match.group(1))
+            measured_cycle = cycle > cfg.warmup_cycles
+            if measured_cycle and cycle not in submitted_background_cycles:
+                new_background_jobs = submit_background_batches_for_cycle(
+                    cfg, namespace, cycle
+                )
+                background_jobs.extend(new_background_jobs)
+                submitted_background_cycles.add(cycle)
+
+        per_job = get_per_job_progress(
+            cfg.context, namespace, extra_jobs=background_jobs
+        )
         batch_accounting = _aggregate_batch_accounting(per_job)
+        tracked_jobs = {
+            name: progress for name, progress in per_job.items()
+            if name in JOB_SLO_WINDOWS
+        }
+        background_job_progress = {
+            name: progress for name, progress in per_job.items()
+            if name in background_jobs
+        }
+        tracked_accounting = _aggregate_batch_accounting(tracked_jobs)
+        background_accounting = _aggregate_batch_accounting(background_job_progress)
+        completed = batch_accounting["completed"]
+        total = batch_accounting["submitted"]
         for jname, jinfo in per_job.items():
-            if jname not in job_completion_times and jinfo["status"] == "completed":
+            if (
+                jname in JOB_SLO_WINDOWS
+                and jname not in job_completion_times
+                and jinfo["status"] == "completed"
+            ):
                 job_completion_times[jname] = round(elapsed)
 
         sample = {
@@ -777,6 +911,8 @@ def monitor_scenario(cfg, scenario, namespace):
             "completed": completed,
             "total": total,
             "batch_accounting": batch_accounting,
+            "tracked_batch_accounting": tracked_accounting,
+            "background_batch_accounting": background_accounting,
             "phase": phase,
             "prometheus": collect_live_prometheus_metrics(namespace),
         }
