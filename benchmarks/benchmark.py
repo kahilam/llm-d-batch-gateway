@@ -746,11 +746,20 @@ def _parse_batch_progress_line(line):
         "cancelled": int(counts.get("cancelled", 0) or 0),
         "expired": int(counts.get("expired", 0) or 0),
         "status": status,
+        # A validating/preprocessing response may report completed=0/0
+        # before the gateway has accepted and counted the input requests.
+        "observed": total > 0,
     }
 
 
 def _finalize_batch_accounting(progress):
     """Add derived pending accounting without guessing queued versus in-flight."""
+    if not progress.get("observed", False):
+        progress["pending"] = None
+        progress["queued"] = None
+        progress["in_flight"] = None
+        return progress
+
     terminal = (
         progress["completed"]
         + progress["failed"]
@@ -774,11 +783,24 @@ def _aggregate_batch_accounting(per_job):
         "pending": 0,
         "queued": None,
         "in_flight": None,
+        "observed": True,
+        "unobserved_jobs": [],
         "jobs": per_job,
     }
     for progress in per_job.values():
+        if not progress.get("observed", False):
+            accounting["observed"] = False
+            continue
         for field in ("submitted", "completed", "failed", "cancelled", "expired", "pending"):
             accounting[field] += progress.get(field, 0)
+    accounting["unobserved_jobs"] = [
+        name for name, progress in per_job.items()
+        if not progress.get("observed", False)
+    ]
+    if not accounting["observed"]:
+        for field in ("submitted", "completed", "failed", "cancelled", "expired", "pending"):
+            if not any(progress.get("observed", False) for progress in per_job.values()):
+                accounting[field] = None
     return accounting
 
 
@@ -806,12 +828,13 @@ def get_per_job_progress(context, namespace, extra_jobs=None):
                     break
             if progress is None:
                 progress = {
-                    "submitted": 0,
-                    "completed": 0,
-                    "failed": 0,
-                    "cancelled": 0,
-                    "expired": 0,
+                    "submitted": None,
+                    "completed": None,
+                    "failed": None,
+                    "cancelled": None,
+                    "expired": None,
                     "status": "not_observed",
+                    "observed": False,
                 }
             jobs[name] = _finalize_batch_accounting(progress)
         except Exception as e:
