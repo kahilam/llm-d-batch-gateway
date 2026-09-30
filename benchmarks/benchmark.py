@@ -1252,6 +1252,24 @@ def start_prometheus_port_forward(context, namespace, service):
     return False
 
 
+def restart_prometheus_port_forward():
+    """Restart the benchmark-managed port-forward after a connection drop."""
+    global _prom_port_forward
+    if _prom_port_forward is None:
+        return False
+
+    old = _prom_port_forward
+    old.stop()
+    pf = PrometheusPortForward(old.context, old.namespace, old.service,
+                               local_port=old.local_port)
+    if not pf.start():
+        _prom_port_forward = None
+        return False
+    _prom_port_forward = pf
+    os.environ["PROMETHEUS_URL"] = pf.url
+    return True
+
+
 def stop_prometheus_port_forward():
     """Stop the background port-forward."""
     global _prom_port_forward
@@ -1332,14 +1350,14 @@ def query_prometheus_instant(query, retries=2):
     import urllib.parse
     import urllib.request
 
-    prom_url = get_prometheus_url()
-    if not prom_url:
+    if not get_prometheus_url():
         return {"query": query, "result": [], "error": "PROMETHEUS_URL is not set"}
 
     params = urllib.parse.urlencode({"query": query})
-    url = f"{prom_url}/api/v1/query?{params}"
     last_error = "query failed"
     for attempt in range(retries + 1):
+        prom_url = get_prometheus_url()
+        url = f"{prom_url}/api/v1/query?{params}"
         try:
             with urllib.request.urlopen(url, timeout=5) as resp:
                 data = json.loads(resp.read())
@@ -1350,6 +1368,8 @@ def query_prometheus_instant(query, retries=2):
         except Exception as e:
             last_error = str(e)
         if attempt < retries:
+            if _prom_port_forward is not None:
+                restart_prometheus_port_forward()
             time.sleep(0.25)
     return {"query": query, "result": [], "error": last_error}
 
